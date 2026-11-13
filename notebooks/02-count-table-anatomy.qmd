@@ -24,6 +24,7 @@ genes    <- read_csv(here(data_dir, "04_rnaseq_counts.csv.gz"))     # 14,226 gen
 taxonomy <- read_csv(here(data_dir, "03_microbiome_taxonomy.csv"))
 ```
 
+
 ```{r}
 metadata
 ```
@@ -36,23 +37,109 @@ Answer before running anything below.
 
 **1. Of the 220 species, how many will you see in a single sample?**
 
-- *Your answer:*
+```{r}
+detected_per_sample <- colSums(as.matrix(species[, -1]) > 0)
+
+median(detected_per_sample)  # 24
+range(detected_per_sample)   # 4 70
+```
+
+```{r}
+   source(here::here("R/count_tables.R"))
+   d  <- read_counts("instructional")
+   m  <- as.matrix(d$species[, -1])   # drop the species-name column, keep counts
+   n  <- colSums(m > 0)               # per sample: how many species are non-zero
+   summary(n)
+   hist(n, breaks = 30)               # quick picture of the spread
+
+```
+
+
+- *Your answer:* An average of 24 species per sample, with a range from 4 to 70.
 
 **2. Of the 14,226 genes, how many will you see in a single sample?**
+```{r}
+detected_genes <- colSums(as.matrix(genes[, -1]) > 0)
 
-- *Your answer:*
+median(detected_genes)  # 14084
+range(detected_genes)   # 13703 14200
+
+``` 
+
+```{r}
+   source(here::here("R/count_tables.R"))
+   d <- read_counts("instructional")
+   g <- as.matrix(d$genes[, -1])      # drop gene-ID column, keep counts
+   summary(colSums(g > 0))            # genes present per sample
+ 
+```
+
+- *Your answer:* An average of 14,084 genes per sample, with a range from 13,703 to 14,200.
+
 
 **3. Which table has a larger share of zero cells?**
+```{r}
+mean(as.matrix(species[, -1]) == 0)  # about 0.889
+mean(as.matrix(genes[, -1]) == 0)    # about 0.011
 
-- *Your answer:*
+```
+- *Your answer:* The species table has the larger share of zero cells: 88.9%, compared with 1.1% in the gene table.
 
 **4. One sample has 438 bacterial reads against a median of about 28,700. What will be wrong with it?**
 
-- *Your answer:*
+- *Your answer:* P028_week_18, with 438 reads versus a median of 28,718 — about 65× shallower than typical.
+
+```{r}
+ lib <- colSums(as.matrix(d$species[, -1]))
+   plot(sort(lib), log = "y", ylab = "total reads")  # one dramatic low point
+   summary(lib)
+
+```
+What's wrong with it (and what isn't):
+
+1. Its species list is mostly a sampling artefact. It shows only 20 species, but with 438 reads you'd expect that even from a rich community — you simply haven't looked hard enough. Sequencing depth works like sampling effort: quadruple the reads and you'll detect more rare species just by chance. So its apparent low diversity is unreliable, not necessarily real.
+
+2. Its relative abundances are noisy. Each species' proportion is estimated from very few reads, so percentages jump around wildly from sampling luck. Compositional claims ("this taxon doubled") are meaningless at this depth.
+
+3. It can distort downstream analyses. If it's left in uncorrected:
+- Alpha-diversity plots will show a suspicious outlier at the bottom;
+- Ordinations (PCA/PCoA) can pull samples around based on depth artefacts;
+- Differential abundance tools like DESeq2 do correct for depth (size factors), so it won't bias scaling —
+but a 65-fold noisier sample still contributes poorly to dispersion estimates and can weaken or skew tests.
+
+4. Crucially, it's a microbiome problem only. The same sample's RNA-seq library looks perfectly normal: ~9.8 million gene reads vs a median of ~12.2 million. So the sequencing failed (or was skipped/truncated) for the 16S library specifically, not for the participant. That distinction is exactly what you'd want to check before deciding what to do with it.
+
+5. The honest unknown: you can't tell from the counts alone whether P028_week_18 genuinely had low bacterial biomass or the library prep just failed. Both are reasons to treat it carefully; neither tells you the biology.
 
 **5. A typical sample behaves like how many equally common species? Like how many equally expressed genes?**
 
-- *Your answer:*
+- *Your answer:*  This number is called the effective number of species (it's exp(Shannon diversity), a "Hill number"). The idea:
+ pretend all species in the sample were perfectly equal in abundance — how many would it take to give the same
+ diversity? If 24 species were truly equal, you'd get 24. Getting 3 means the community is strongly dominated by
+ a few species and the other ~21 are rare hangers-on.
+
+ Same story for genes: ~14,000 genes are detected, but typical expression is dominated by a few hundred — the
+ classic "few genes do most of the work" shape of RNA-seq data.
+
+ So your two communities are more similar in structure than the raw numbers suggest: both are a few dominants
+ plus a long tail. The species table just has a longer tail (and more zeros, as we saw).
+
+ Two side observations:
+ - The minimum effective species count is 1.01 — that's P028_week_18, our 438-read friend. At that depth you see
+   essentially only the dominant species, another reason not to trust that sample.
+ - These are the numbers to reach for when comparing diversity between groups: they're much more interpretable
+   than raw Shannon values (e.g. "group A has ~5 effective species, group B has ~2" beats "Shannon 1.6 vs 0.7").
+
+ ```{r}
+eff <- function(m) {
+ p <- sweep(m, 2, colSums(m), "/")        # each species as a share of the sample
+  exp(-colSums(p * log(p), na.rm = TRUE))  # exp of Shannon entropy
+  }
+  summary(eff(as.matrix(d$species[, -1])))    # median ≈ 3.2
+  summary(eff(as.matrix(d$genes[, -1])))      # median ≈ 1055
+
+ ```
+
 
 ## Part 2 — Ask, look, decide
 
@@ -65,11 +152,23 @@ zeros, the share held by the largest feature, Shannon diversity, and the
 effective number of features.*
 
 - Does it have 942 rows, 471 for each table?
-  - *Your answer:*
+  - *Your answer:* Yes, 942 rows: 471 for species and 471 for genes.
+
 - Type `sum(species$P001_week_18)` in the console. Does it match Pi's library size for that sample?
-  - *Your answer:*
+
+```{r}
+sum(species$P001_week_18)
+
+```
+  - *Your answer:* 22756 Yes, it matches Pi's library size for that sample.
+
+
 - Is features detected never more than 220 (species) or 14,226 (genes)?
-  - *Your answer:*
+  - *Your answer:* So no sample ever reports more features than exist in the table — a good sanity check that the orientation (features in rows, samples in columns) and the counting logic are right. If features_detected had somehow exceeded 220 or 14,226, it would mean rows and columns got flipped somewhere.
+
+ The interesting asymmetry: species max out at only 70 of 220 (~32%), while genes nearly saturate at 14,200 of 14,226 (~99.8%). That's the sparsity difference we talked about showing up again — species genuinely absent from each community, genes detected almost everywhere.
+
+ Or more simply: range(per_sample_counts$features_detected) — you should see 4 to 14,200, and since the two tables are stacked with the ceiling gap in between, nothing can exceed its own cap.
 
 ### Step 2: a short report
 
@@ -79,6 +178,7 @@ write three sentences about anything unusual.*
 
 - Which medians were furthest from your Part 1 answers?
   - *Your answer:*
+  
 - Did Pi mention the 438-read sample? Did it claim anything you cannot find in the table?
   - *Your answer:*
 

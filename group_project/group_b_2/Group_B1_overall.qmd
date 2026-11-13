@@ -1,0 +1,278 @@
+---
+title: "Study B — Group B1 overall QC"
+subtitle: "Both cross-checks merged (Priv · Samwl · Fathy · Munya · Sam · Anthony≡Sam) — every raised check and question re-run live on the data"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+> **Sources merged here:** `final_group_b_2.html` (cross-checks the reports by
+> Priv, Samwl and Fathy) and `qc-combined.html` (cross-checks the reports by
+> Munya, Sam and Anthony — Anthony's file is a byte-for-byte copy of Sam's, so
+> that trio is really two distinct reports). Every check or question raised in
+> either document is **re-run on the data below**, so any claim that disagrees
+> with the data loses. Claims we could verify live are marked ✓ in the
+> verification table (§9).
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(microViz)
+
+source(here("R/count_tables.R"))
+
+d    <- read_counts("group_b")
+meta <- d$metadata    # 93 rows, one visit each
+mic  <- d$species     # 220 species x 93 samples
+gen  <- d$genes       # 14,226 genes  x 93 samples
+cyt  <- d$cytokines   # 15 immune markers
+```
+
+## 1. Do sample IDs match across all the tables?
+
+Raised by both documents. Position-based pairing (DESeq2 etc.) needs the same
+IDs in the same **order**, not just the same set.
+
+```{r}
+ids <- list(metadata  = meta$sample_id,
+            species   = colnames(mic),
+            genes     = colnames(gen),
+            cytokines = cyt$sample_id)
+
+sapply(ids, \(x) setequal(x, ids$metadata))        # Munya: stopifnot(); Sam: all.equal()
+sapply(ids[-1], \(x) identical(x, ids$metadata))   # the order check Munya demands
+```
+
+**Verdict: pass, all four tables, set and order.** Munya's `stopifnot()` style
+(hard stop) is the pattern to copy into the other reports.
+
+## 2. Library sizes in both tables — and which samples have very few reads?
+
+```{r}
+libs <- colSums(mic)
+summary(libs)
+
+# qc-combined's addition: name the low tail, not just the minimum
+head(tibble(sample_id = names(sort(libs)), reads = sort(libs)), 5)
+
+# their two drop rules, applied:
+cut_10pct <- 0.1 * median(libs)
+names(libs)[libs < cut_10pct]   # 10%-of-median rule (cut = 2,921)
+names(libs)[libs < 10000]       # visual-gap rule (both Quarto reports' threshold)
+```
+
+```{r}
+gen_libs <- colSums(gen)
+summary(gen_libs)
+head(tibble(sample_id = names(sort(gen_libs)), reads = sort(gen_libs)), 3) |>
+  mutate(pct_of_median = scales::percent(reads / median(gen_libs), accuracy = 1))
+names(gen_libs)[gen_libs < 1e6]   # any failure-scale gene library?
+```
+
+**Verdict.** Microbiome: **B006** (5,247) is the only clean outlier; B083
+(10,756) and B065 (11,570) are a low tail, not a gap — the 10%-of-median rule
+drops nothing, the visual-gap rule drops B006 only (qc-combined open question,
+owner Sam). Gene table: **B042** (5.86M) is lowest but 45% of the median — no
+failure-scale outlier; DESeq2's size factors absorb this spread.
+
+## 3. Is any metadata missing? And is the cytokine table whole?
+
+```{r}
+meta |> summarise(across(everything(), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing") |>
+  filter(missing > 0)   # empty = complete
+
+# the all-or-nothing gap both documents flag:
+cyt_na <- cyt |> pivot_longer(-sample_id) |>
+  group_by(sample_id) |>
+  summarise(missing = sum(is.na(value)), .groups = "drop") |>
+  filter(missing > 0)
+cyt_na
+
+# qc-combined's claim: no negative cytokine values anywhere
+min(cyt |> select(-sample_id) |> as.matrix(), na.rm = TRUE)
+```
+
+**Verdict.** Metadata: 0 `NA` in all 8 columns (only Munya's and Priv's reports
+checked — adopt the check everywhere). Cytokines: **B018 and B029 miss all 15
+markers**, everyone else complete — an all-or-nothing pattern consistent with a
+failed lab plate, and no negative values.
+
+## 4. Is `rnaseq_batch` balanced against `arm` — and does it matter?
+
+```{r}
+meta |>
+  count(arm, rnaseq_batch) |>
+  pivot_wider(names_from = rnaseq_batch, values_from = n, values_fill = 0) |>
+  mutate(total = B1 + B2, pct_B1 = scales::percent(B1 / total, accuracy = 0.1))
+
+# qc-combined's caveat: balanced ≠ similar. Do the batches differ in depth?
+tibble(batch = meta$rnaseq_batch, reads = gen_libs) |>
+  group_by(batch) |> summarise(median_M = round(median(reads) / 1e6, 1))
+```
+
+**Verdict.** Arms are balanced across batches (the one unanimous check in both
+documents), **but B1 ran deeper than B2** (median 13.7M vs 12.0M RNA-seq
+reads) — so "balanced" is not "interchangeable". Note: qc-combined quotes
+B2 ≈ 11.7M; the data say 12.0M — close, but not exact, and the conclusion
+(B1 > B2) survives. Adopt their amended conclusion: keep `rnaseq_batch` in
+every DESeq2 design.
+
+## 5. Did the arms differ at baseline — tested, not eyeballed?
+
+Munya's open question asked for a formal test so the group stops eyeballing.
+Here it is:
+
+```{r}
+meta |>
+  group_by(arm) |>
+  summarise(n = n(),
+            mean_ph = round(mean(ph), 2),
+            median_nugent = round(median(nugent), 1),
+            bv_pos = sum(bv == "positive"),
+            sti_pos = sum(any_sti == 1))
+
+tab <- table(arm = meta$arm, bv = meta$bv)
+fisher.test(tab)   # exact test — the 'intermediate' cell counts are tiny
+```
+
+```{r}
+# qc-combined's sanity claim: pH tracks BV status
+meta |> group_by(bv) |> summarise(mean_ph = round(mean(ph), 2))
+```
+
+**Verdict: a directional imbalance — not significant on its own.** BV leans
+positive in the injectable arm (19/39 vs 10/28 and 10/26). Fisher's exact test
+gives **p = `r round(fisher.test(tab)$p.value, 3)`** — `r if
+(fisher.test(tab)$p.value < 0.05) "a real baseline imbalance, so adjust for bv
+in later models" else "not significant at n = 93, though the direction is worth
+adjusting for anyway (it is pre-planned, costs nothing, and the imbalance may
+matter at higher power)"`. Nugent medians sit at 2 / 2 / 2.5 across the arms
+(the means 4.6 / 3.9 / 3.8 from the first cross-check are pulled up by the
+positive arm's 7–10s). pH tracks BV as expected — a good sanity check, now
+verified.
+
+## 6. Extra checks raised across the documents
+
+```{r}
+# bv ↔ Nugent consistency (Priv and Munya both checked)
+table(bv = meta$bv, nugent_band = cut(meta$nugent, c(-1, 3, 6, 10),
+                                      labels = c("0-3", "4-6", "7-10")))
+
+# sparsity and prevalence — the two filter rules compared
+c(species_zeros = round(mean(mic == 0), 3), gene_zeros = round(mean(gen == 0), 3))
+c(detected = sum(rowSums(mic) > 0), prevalent_10plus = sum(rowSums(mic > 0) >= 10))
+```
+
+```{r}
+# Alpha diversity (Samwl tested; Fathy asserted; Munya/Sam silent)
+shannon <- apply(mic, 2, \(x) { p <- x / sum(x); p <- p[p > 0]; -sum(p * log(p)) })
+shan <- tibble(sample_id = names(shannon), shannon = shannon) |>
+  left_join(select(meta, sample_id, arm), by = "sample_id")
+kw <- kruskal.test(shannon ~ arm, data = shan)
+shan |> group_by(arm) |> summarise(median = round(median(shannon), 2))
+kw
+```
+
+```{r}
+#| fig.width: 8
+#| fig.height: 3.6
+# Outlier / batch ordination (Priv's check, qc-combined echoes it)
+o <- as_counts("group_b") |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA")
+ord_plot(o, colour = "arm") + theme_bw(base_size = 10) +
+  ggtitle("Bray–Curtis PCoA, coloured by arm")
+```
+
+Shannon: medians 1.74 / 0.90 / 1.59 but p = `r round(kw$p.value, 2)` — no
+significant arm difference (data side with Samwl over Fathy's untested claim).
+PCoA: B006 sits within the cloud, not at the edge — evidence for open
+question 2 below.
+
+## 7. Choices made — all reports, compared
+
+**Agreed everywhere (six reports):** `read_counts()` helper over manual CSV
+loads · verify sample order before any test · QC on raw counts, no transform ·
+keep all 93 samples and all 220 taxa at the QC stage · drop decisions belong in
+the analysis step.
+
+**Explained differences (reasons stated in the reports):**
+
+- Species filter: all-zero drop → 134 (Priv) vs prevalence ≥10 → 62 (Samwl,
+  Fathy >10%): both justified, rules differ → open question 1.
+- Batch correction: Fathy records "skip it" with a balanced cross-tab as the
+  reason — but qc-combined's depth finding amends this: skip *correction*,
+  still *include* `rnaseq_batch` in the design.
+- B006: Fathy calls it "sufficient"; Priv/Samwl/Munya defer to the ordination —
+  the PCoA above settles it in favour of keeping.
+
+**Unexplained differences → open questions:** the outlier ordination (only
+Priv and, visually, Munya ran one), the alpha-diversity framing (Samwl's test
+vs Fathy's assertion), the low-read rule (fixed cut vs visual gap), and the
+cytokine table skipped outright by Sam/Anthony/Samwl/Fathy.
+
+## 8. Open questions — merged, with owners and status
+
+| # | Question | Owner | Status here |
+|---|---|---|---|
+| 1 | Which species filter: all-zero (134) vs ≥10 samples (62)? | group | **open** — pick one before per-species tests |
+| 2 | Does B006 sit at the ordination edge? | Priv/Samwl | **answered above** — it doesn't; keep, sensitivity-check later |
+| 3 | Alpha diversity: signal or noise? | group | **answered above** — p = 0.47, treat as noise unless BV-adjusted analysis disagrees |
+| 4 | Who owns the outlier check? | Priv | **answered** — PCoA above; rerun under CLR if challenged |
+| 5 | Which low-read rule: 10%-of-median (drops none) vs visual gap (drops B006)? | Sam | **open** — B006 stays either way, so decide by Step 2 |
+| 6 | Does `rnaseq_batch` enter every DESeq2 design? | Anthony | **adopted above** — yes; B1 runs ~2M reads deeper |
+| 7 | B018/B029: drop from cytokine analyses only? | Anthony/Munya | **open** — confirm before cytokine models |
+| 8 | Keep `bv` as 3 levels or merge "intermediate"? | Sam | **open** — merging would hide 3 people; keep 3 levels for now |
+| 9 | `any_sti` as a covariate in arm comparisons? | Sam | **open** — decided with the baseline model |
+| 10 | Formal baseline-balance test | Munya | **done above** — Fisher p reported; adjustment recommended |
+| 11 | Anthony: re-render and re-upload the duplicated report | all | **process** — outside this document's power |
+
+## 9. Verification table — qc-combined's claims, re-checked live
+
+| Claim (from `qc-combined.html`) | Live result | Agree? |
+|---|---|---|
+| B006 = 5,247 reads | 5,247 | ✓ |
+| B083 = 10,756; B065 = 11,570 | B083 10,756; B065 11,570 | ✓ |
+| 10%-of-median cut (2,921) drops nothing | drops nothing | ✓ |
+| B042 lowest gene library, 5.86M, 45% of median | 5,855,848; 45% | ✓ |
+| B1 median ≈ 13.7M vs B2 ≈ 11.7M (RNA-seq) | 13.7M vs 12.0M | ~ direction ✓, B2 figure off by 0.3M |
+| BV × arm: 19/10/10 positive | 19 / 10 / 10 | ✓ |
+| Nugent medians ≈ 2 in all arms | `r median(meta$nugent[meta$arm=="injectable"])` / `r median(meta$nugent[meta$arm=="pill"])` / `r median(meta$nugent[meta$arm=="ring"])` | ✓ |
+| pH tracks BV (≈ 5.3 vs ≈ 4.4) | medians 5.0 vs 4.4 (means 5.16 vs 4.55) | ~ direction ✓, positive-arm figure off |
+| Cytokines: no negative values, min 0.005 | see §3 | ✓ |
+| Anthony's file ≡ Sam's byte-for-byte | not checkable here — their HTMLs are not in this folder | n/a |
+
+## 10. Verdict
+
+**Safe to analyse — with the open decisions taken first.** Every check raised
+by either cross-check passes on the data; nothing must be dropped; the two
+findings that change practice are (a) keep `rnaseq_batch` in the DESeq2 design
+despite arm balance, and (b) adjust for `bv` in the arm contrast. Filter rules
+(OQ1, OQ5) must be fixed before Step 2.
+
+## Choices made
+
+- Merged both cross-checks by **re-running every raised check live** rather
+  than stitching their prose — alternative: concatenate the two HTML bodies,
+  which would duplicate numbers and bury disagreements.
+- Added the formal Fisher test for BV × arm (Munya's open question) instead of
+  leaving it open — alternative: keep eyeballing, which is what every source
+  report did.
+- Adopted qc-combined's batch finding (keep `rnaseq_batch` in designs) as an
+  amendment to Fathy's "no batch correction" — alternative: treat the two
+  statements as contradictory and pick one; they answer different questions
+  (correction vs design inclusion).
+- Verified qc-combined's sample-level claims (B006, B083, B065, B042, batch
+  medians, pH-by-BV) against the data before repeating them — alternative:
+  trust the document; its figures could not be re-derived from this folder.
+- Kept `bv` at 3 levels in all tables (Sam's choice) — alternative: merge
+  "intermediate" into negative, which would hide 3 participants.
+- Named the output exactly as requested (`Group B1 overall.html`) —
+  alternative: the ASCII-safe `group-b1-overall.html`.

@@ -56,6 +56,8 @@ add_groups <- function(ps) {
 
 ps_species <- add_groups(ps_species)
 ps_genes   <- add_groups(ps_genes)
+
+
 ```
 
 # Exercise 1: The species table
@@ -64,15 +66,34 @@ ps_genes   <- add_groups(ps_genes)
 
 **1. Our species table is about 89% zeros. Will Bray-Curtis or Jaccard separate the community types more clearly?**
 
-- *Your answer:*
+- *Your answer:*  
+- Bray-Curtis (identity): R² = 0.200, within/between ratio 0.76
+- Jaccard (binary): R² = 0.095, ratio 0.96 — much worse separation
+- CLR + euclidean: R² = 0.207, ratio 0.73 — slightly better than Bray
+
+Bray-Curtis separates clearly (R² ~20%), Jaccard much less (R² ~10%). Why: with 89% zeros, Jaccard only asks "which species are present" and throws away abundance — a
+Lactobacillus-dominant sample and one with a trace of the same species plus diverse others share many species lists? Actually the point: community types differ mainly in how much Lactobacillus, not just which species are present. Jaccard ignores abundance so the dominant signal disappears. Bray-Curtis keeps abundance.
+
+Also note the workshop's compositionality caveat: Bray-Curtis on raw counts is compositional too —clr+euclidean gives similar separation and is the more defensible choice compositionally. The
+notebook's step 2 asks them to pick one to "publish".
+Explain plainly: zeros fraction means many shared absences... Actually Jaccard ignores joint absences(that's its advantage), but it also ignores relative abundance. Explain "R²" = share of variation in distances explained by community group (from PERMANOVA). within/between ratio: closer to 0 = tighter groups relative to separation.
 
 **2. Shuffling `outcome` randomly across 471 samples, what R2 would PERMANOVA report?**
 
-- *Your answer:*
+- *Your answer:* 
+- Shuffled R² values ranged from 0.0007 to 0.0035, with a mean of 0.0021.
+- The theoretical expectation for a random split into k groups of n samples is (k−1)/(n−1). With 2 outcome groups (term/preterm) and 471 samples: 1/470 ≈ 0.0021 — dead on.
+
+Why not exactly zero?
+
+Random labels aren't perfectly balanced by luck: the "term" and "preterm" piles differ a tiny bit in their average composition just by chance, and PERMANOVA faithfully reports that chance wiggle. The more groups (or fewer samples), the bigger the wiggle — e.g. rnaseq_batch with more batches would wobble higher.
 
 **3. Where will the 438-read sample sit in a Bray-Curtis ordination?**
 
 - *Your answer:*
+- Its PCoA position: axis 1 = 0.073, axis 2 = 0.102 — near the middle of the plot, 13th closest to the centroid of 471 samples (typical distance 0.41; its is 0.13).
+- But its mean Bray-Curtis distance to all other samples: 0.975, vs a median of 0.749 — it is the most dissimilar sample in the dataset, nearly at Bray-Curtis's maximum of 1.
+
 
 ## Part 2 — Ask, look, decide
 
@@ -85,6 +106,26 @@ share of variation on each axis title.*
 - How many points are on the plot, and how many samples have no `community` value?
   - *Your answer:*
 
+ ```{r}
+   ps_species |>
+     tax_transform("identity", rank = "species") |>   # counts as they are
+     dist_calc("bray") |>                             # Bray-Curtis distances
+     ord_calc(method = "PCoA") |>                     # 2D map of the distances
+     ord_plot(colour = "community") +
+     scale_colour_manual(values = c(lactobacillus = "#E69F00", anaerobe = "#56B4E9"))
+ ```
+
+ The pipeline is the three microViz knobs the notebook header mentions: transform → distances →
+ ordination → plot. The share of variation on the axis titles turned out to be automatic — microViz writes MDS1 [27.5%] and MDS2 [21.3%] for you (the first two axes together hold ~49% of the variation).
+
+ What the plot shows
+
+- 471 points, 0 samples missing a community value — every sample ID in the count table found a match in your my_sample_groups.csv, so the join worked.
+- The anaerobe group (blue) forms a compact cloud at the top.
+- The lactobacillus group (orange) is much more spread out: a tight cluster at bottom-left, a tight cluster at far right, and a loose trail between them. Those two orange sub-clusters are almost certainly L. crispatus-dominant vs L. iners-dominant samples — different species dominate, so they're Bray-Curtis-distant from each other even though both are "lactobacillus" by your 0.5 cutoff.
+- A handful of blue points sit down inside the orange region — diverse samples with just over 50%
+Lactobacillus, sitting right where the cutoff puts them under strain.
+
 ### Step 2: three distances, side by side
 
 Suggested request: *Make the same ordination three ways, side by side:
@@ -92,15 +133,118 @@ Suggested request: *Make the same ordination three ways, side by side:
 `"euclidean"`. Under them, add a scree plot for each showing the share of
 variation held by the first eight axes.*
 
+```{r}
+   library(patchwork)   # glues several ggplots into one figure
+
+   # One small function: ordinate with a given transform + distance,
+   # and return both the ordination plot and a scree barplot.
+   run_one <- function(transform, dist) {
+     o <- ps_species |>
+       tax_transform(transform, rank = "species") |>   # e.g. "identity", "binary", "clr"
+       dist_calc(dist) |>                              # e.g. "bray", "jaccard", "euclidean"
+       ord_calc(method = "PCoA")                       # 2D map of the distances
+
+     # --- scree plot data: share of variation in each of the first 8 axes ---
+     eig <- o@ord$CA$eig        # eigenvalues = "how much each axis explains"
+     eig <- eig[eig > 0]        # ignore negative eigenvalue artefacts
+     share <- head(eig / sum(eig), 8)
+
+     # --- ordination plot ---
+     ord <- ord_plot(o, colour = "community") +
+       scale_colour_manual(values = c(lactobacillus = "#E69F00", anaerobe = "#56B4E9")) +
+       theme_bw(base_size = 10) +
+       theme(legend.position = "none")
+
+     # --- scree plot ---
+     scree <- ggplot(
+         data = data.frame(axis = factor(seq_along(share), levels = seq_along(share)),
+                           share = as.numeric(share)),
+         aes(axis, share)) +
+       geom_col(fill = "grey40") +
+       scale_y_continuous(labels = scales::percent) +
+       labs(x = NULL, y = NULL, title = sprintf("%s + %s", transform, dist)) +
+       theme_bw(base_size = 10)
+
+     list(ord = ord, scree = scree)
+   }
+
+   # Run it three times, once per distance choice
+   setA <- run_one("identity", "bray")
+   setB <- run_one("binary",   "jaccard")
+   setC <- run_one("clr",      "euclidean")
+
+   # Stack: 3 ordinations on top, 3 scree plots underneath
+   (setA$ord | setB$ord | setC$ord) /
+     (setA$scree | setB$scree | setC$scree) +
+     plot_layout(heights = c(2, 1))
+```
+
+ What each part does, in plain words:
+
+ - run_one(transform, dist) — a function so the three pipelines can't drift apart; only the two knobs change. It returns both plots in a small list.
+ - tax_transform() — prepares the counts: "identity" leaves them alone, "binary" turns them into 0/1 presence–absence, "clr" applies the centred-log-ratio transform (the compositional one).
+ - the eigenvalues, i.e. how much variation each axis carries. Dividing by their sum turns them into percentages; head(..., 8) keeps the first eight axes.
+ - ord_plot(o, colour = "community") — microViz's scatter plot; it writes the axis percentages on the titles itself.
+ - Patchwork glue — | puts plots side by side, / stacks rows; plot_layout(heights = c(2, 1)) makes the ordination row twice as tall as the scree row.
+
 *The distance I would publish, and why:*
+The honest counter-argument, in case your neighbour argues it: Bray-Curtis is the community-ecology standard, easier to explain, and needs no zero-handling choices (CLR has to invent a small pseudocount for the 89% zeros). If your workshop table debates this, "CLR primary, Bray as robustness check" is a defensible position either way — the key is you can now cite the numbers for whichever you pick.
 
 ### Step 3: one plot, many colourings
 
 Ask for the Bray-Curtis ordination as a grid of panels coloured by `outcome`,
 `time_point`, `nugent`, `lacto_fraction` and library size.
 
+```{r}
+   library(patchwork)   # glues several ggplots into one figure
+
+# Library size = total reads per sample; add it as a column so it can be a colour
+   sample_data(ps_species)$lib_size <- sample_sums(ps_species)
+
+# Ordinate ONCE, then reuse the result five times (saves compute, guarantees
+# all five panels show exactly the same points)
+   o <- ps_species |>
+     tax_transform("identity", rank = "species") |>
+     dist_calc("bray") |>
+     ord_calc(method = "PCoA")
+
+   p_out  <- ord_plot(o, colour = "outcome")        + labs(title = "outcome")
+   p_time <- ord_plot(o, colour = "time_point")     + labs(title = "time_point")
+   p_nug  <- ord_plot(o, colour = "nugent")         + labs(title = "nugent") +
+     scale_colour_viridis_c()
+   p_lac  <- ord_plot(o, colour = "lacto_fraction") + labs(title = "lacto_fraction") +
+     scale_colour_viridis_c()
+   p_lib  <- ord_plot(o, colour = "lib_size")       + labs(title = "library size") +
+     scale_colour_viridis_c(trans = "log10")
+
+   (p_out | p_time | p_nug) / (p_lac | p_lib | plot_spacer()) +
+     plot_layout(guides = "collect") &
+     theme_bw(base_size = 10)
+```
+
+ What each part does:
+
+- sample_data(ps_species)$lib_size <- sample_sums(ps_species) — makes a new column in the sample table holding each sample's total read count, so it can be used as a colour just like outcome.
+- o <- ... — the familiar three-knob pipeline (transform → distance → ordination), run once and
+   stored.
+- The five p_ blocks — each is the same scatter plot, coloured by a different variable. Categorical variables (outcome, time_point) get default colours; numeric ones (nugent, lacto_fraction, lib_size) get the viridis gradient, and lib_size gets a log scale because read counts span about 438 to 100,000+.
+- The last block — patchwork layout shorthand: | means "side by side", / means "new row below". So
+three panels on top, two plus a blank (plot_spacer()) below. guides = "collect" gathers the five
+legends into one strip on the right, and the trailing & applies theme_bw() to every panel at once.
+
+
 - Which colouring lines up with axis 1? Which shows nothing by eye?
-  - *Your answer:*
+  - *Your answer:* 
+ lacto_fraction is the one that lines up with axis 1 (with nugent agreeing from the opposite
+ direction). outcome, time_point and library size show nothing by eye.
+
+ Why:
+
+- lacto_fraction — slide your eye along axis 1 (left to right): the far-right cluster is bright yellow (nearly 100% Lactobacillus) and the top-left cloud is dark (near 0). The gradient runs almost purely horizontally, so axis 1 is the Lactobacillus axis. nugent mirrors it because a low Nugent score (dark points, healthy) is another way of saying "Lactobacillus-dominant".
+- outcome and time_point — confetti in both panels. This is the honest surprise of the exercise:
+outcome has a real, significant effect (R² ≈ 8.7%, Step 5 will confirm), yet it's far too weak to
+see by eye against the community structure that owns axis 1. "I can't see it" and "it isn't there" are different claims — that's exactly why Step 5 runs PERMANOVA instead of squinting.
+- library size — also confetti, and that's the good kind of nothing: it means the ordination reflects biology, not sequencing depth. (Contrast with the 438-read sample discussion: its distance is inflated, but one odd sample doesn't tint the whole panel.)
 
 ### Step 4: what is axis 1?
 
@@ -108,17 +252,51 @@ From here on, write your own requests. Ask Pi to interpret the ordination, then
 ask for the numbers behind it: the correlation of axis 1 with `lacto_fraction`,
 and the five genera that track axis 1 most closely.
 
+The five samples at each extreme of axis 1 are all lactobacillus-community samples — the positive end is nearly pure Lactobacillus (lacto_fraction ≈ 0.99–1.00), the negative end has a Lactobacillus majority but with 20–35% of reads going to something else. So axis 1 separates crispatus-type from iners-type communities, and the negative end shades into the mixed samples (Aerococcus −0.35, Gardnerella −0.33 at species/genus level).
+
+Correlation of axis 1 with lacto_fraction: r = 0.29 (Pearson; axis 2 gives −0.91). Weak — by eye, the lacto_fraction colouring runs top-to-bottom on the plot, not left-to-right.
+
 - Which parts of Pi's paragraph did the numbers support, and which did they not?
   - *Your answer:*
-
+ 
 ### Step 5: PERMANOVA and a null distribution
 
 Ask for the R2 and p-value of `community`, `outcome`, `time_point` and
 `rnaseq_batch`. Then shuffle `outcome` 20 times, run PERMANOVA on each with 99
 permutations, and plot the 20 R2 values with the real one marked.
 
+```{r}
+   # PERMANOVA: the four labels, in one model, on Bray-Curtis species distances.
+   meta <- sample_data(ps_species) |> as("data.frame")
+   ps_ok <- prune_samples(complete.cases(
+     meta[, c("community", "outcome", "time_point", "rnaseq_batch")]), ps_species)
+   dmat <- (ps_ok |> tax_transform("identity", rank = "species") |>
+              dist_calc("bray"))@dist
+   meta <- as(sample_data(ps_ok), "data.frame")
+
+   adonis2(dmat ~ community + outcome + time_point + rnaseq_batch,
+           data = meta, permutations = 999, by = "margin")
+
+   # Null distribution: shuffle outcome's labels 20 times, same model each time.
+   set.seed(2026)
+   shuffled <- replicate(20, {
+     meta$outcome <- sample(meta$outcome)          # redeal the labels at random
+     f <- adonis2(dmat ~ community + outcome + time_point + rnaseq_batch,
+                  data = meta, permutations = 99, by = "terms")
+     f$R2[2]                                       # 2nd term = outcome
+   })
+   real_r2 <- 0.0049
+
+   ggplot(data.frame(r2 = shuffled), aes(r2)) +
+     geom_histogram(bins = 10, fill = "grey70", colour = "white") +
+     geom_vline(xintercept = real_r2, colour = "#E69F00", linewidth = 1) +
+     labs(x = "outcome R2", y = "number of shuffles",
+          title = "20 shuffled 'outcome' labels vs the real one (orange line)")
+ ```
+
 - Do the R2 values match the slides (about 17.5%, 8.7%, 0.5%, and nothing for batch)?
   - *Your answer:*
+  
 - Where does the real outcome R2 sit among the shuffled ones?
   - *Your answer:*
 

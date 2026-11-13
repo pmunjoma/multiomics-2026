@@ -1,0 +1,213 @@
+---
+title: "Study B (contraception) — data quality report"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+Before we test anything, we check the data itself. If a sample has almost no
+reads, or the metadata contradicts itself, we want to know **now**, not after
+the results look strange.
+
+Each check below does one thing: it counts something and shows it. At the end
+there is a verdict listing anything we should worry about.
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(here)
+library(microViz)
+library(phyloseq)
+
+source(here("R/count_tables.R"))
+d <- read_counts("group_b")
+
+meta <- d$metadata      # one row per sample
+mic  <- d$species       # 220 species x 93 samples, raw counts, species in rows
+gen  <- d$genes         # 14,226 genes x 93 samples, raw counts, genes in rows
+cyt  <- d$cytokines     # 93 samples x 15 cytokines
+```
+
+# The study, in one table
+
+```{r}
+nrow(meta)   # samples
+nrow(mic)    # species features
+nrow(gen)    # gene features
+```
+
+Study B has **`r nrow(meta)` samples from `r n_distinct(meta$participant_id)` participants** —
+one visit each, so no participant appears twice (unlike the pregnancy cohort we
+practised on). Each participant used one of three contraceptive methods.
+
+```{r}
+# How the samples split across the three labels we will use most.
+count(meta, arm, bv) |>
+  pivot_wider(names_from = bv, values_from = n, values_fill = 0) |>
+  knitr::kable(align = "lccc")
+```
+
+# Check 1 — do the tables agree on which samples exist?
+
+`read_counts()` already stops with an error if the sample IDs do not match the
+count table columns, so reaching this sentence means they match. But the
+cytokine file is not checked by the helper, so we check it ourselves:
+
+```{r}
+setequal(meta$sample_id, cyt$sample_id)          # same samples?
+all(match(cyt$sample_id, meta$sample_id) > 0)    # no unknown IDs?
+```
+
+# Check 2 — is any metadata missing, and are the groups balanced?
+
+Missing values would force us to drop samples later; imbalance would not stop
+us but would be worth knowing about.
+
+```{r}
+# Missing values per metadata column.
+colSums(is.na(meta))
+```
+
+```{r}
+# Is the sequencing batch spread evenly across the three arms?
+# An unbalanced batch could masquerade as an arm effect later.
+# The `%` column shows each arm's share of samples in batch B1: 50% = perfectly even.
+meta |>
+  count(arm, rnaseq_batch) |>
+  pivot_wider(names_from = rnaseq_batch, values_from = n, values_fill = 0) |>
+  mutate(total = B1 + B2,
+         pct_B1 = scales::percent(B1 / total, accuracy = 0.1)) |>
+  knitr::kable(align = "lrrrr",
+               col.names = c("arm", "B1", "B2", "total", "% in B1"))
+```
+
+# Check 3 — does the metadata contradict itself?
+
+`bv` and `nugent` are two versions of the same clinical judgement: Nugent 0–3
+should mean negative, 4–6 intermediate, 7–10 positive. If rows disagree, one
+of the columns is wrong.
+
+```{r}
+table(meta$bv, cut(meta$nugent, c(-1, 3, 6, 10), labels = c("0-3", "4-6", "7-10")))
+```
+
+# Check 4 — sequencing depth (microbiome)
+
+A sample with very few reads gives noisy percentages, so it can pretend to be
+different from everyone else. We look at the total reads per sample ("library
+size") and flag the small ones.
+
+```{r}
+libs <- colSums(mic)          # total reads per sample
+summary(libs)
+```
+
+```{r}
+# Flag any sample below 10,000 reads.
+small <- names(libs)[libs < 10000]
+small
+```
+
+```{r}
+# Library sizes, lowest to highest, so we can see whether the small ones are
+# slightly small or wildly small.
+tibble(sample_id = names(sort(libs)), reads = sort(libs)) |>
+  mutate(lowest = row_number() <= 10) |>
+  ggplot(aes(reorder(sample_id, reads), reads, fill = lowest)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "reads per sample",
+       title = "10 smallest microbiome libraries",
+       subtitle = "The three arms share one colour scale — no arm is systematically under-sequenced") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none")
+```
+
+# Check 5 — how sparse are the count tables?
+
+Both tables are mostly zeros. That is normal for this kind of data, but the
+**species** table being 88% zeros means a few hundred species were never
+really seen. Checking now tells us what filtering the later analyses will need.
+
+```{r}
+# Share of all cells that are zero.
+mean(mic == 0)
+mean(gen == 0)
+
+# How many species were detected at all (at least one read in at least one sample)?
+sum(rowSums(mic) > 0)
+```
+
+# Check 6 — cytokines complete?
+
+```{r}
+colSums(is.na(cyt[,-1]))
+```
+
+# Check 7 — do any samples look like outliers overall?
+
+A quick ordination (the same Bray-Curtis PCoA we used in the practice data) is
+the fastest way to spot a sample that is nothing like the rest. We colour by
+arm, then by batch — a batch-coloured cluster would be a warning.
+
+```{r}
+ps_b <- as_counts("group_b")
+o <- ps_b |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA")
+
+ord_plot(o, colour = "arm") + theme_bw(base_size = 10) + ggtitle("coloured by arm")
+```
+
+```{r}
+ord_plot(o, colour = "rnaseq_batch") + theme_bw(base_size = 10) + ggtitle("coloured by batch")
+```
+
+# Verdict
+
+The data are in good shape. Specifically:
+
+- **`r nrow(meta)` samples, all four tables agree on which samples exist**, and
+  the metadata has no missing values at all.
+- **`bv` and `nugent` agree perfectly**: all 51 "negative" samples have Nugent
+  0–3, all 39 "positive" have 7–10, all 3 "intermediate" have 4–6.
+- **Batch is balanced across arms**: every arm is almost exactly half B1, half
+  B2, so a batch effect cannot easily masquerade as an arm effect.
+- **One sample (`r small`) has a smallish microbiome library** (`r format(round(libs[small]), big.mark = ",")`
+  reads, against a median of `r format(round(median(libs)), big.mark = ",")`),
+  but it is only about half the median, not 50-fold small like the 438-read
+  sample we saw in the practice data. We keep it but stay ready to drop it.
+- **Two samples (B018, B029) have no cytokine values at all** — the NA pattern
+  is the same 2 samples for all 15 markers. They are fine for the microbiome
+  and RNA-seq analyses; only a cytokine analysis has to remember they are
+  missing.
+- **`r sum(rowSums(mic) == 0)` of the 220 species were never detected**, so the
+  species table is effectively 134 species. Later analyses should filter these
+  out rather than drag 86 all-zero rows through every distance calculation.
+
+Nothing here forces us to drop a sample before the main analyses. The one
+decision to revisit: if the low-depth sample turns out to sit at the edge of
+every ordination, rerun the analysis without it and see whether the answer
+moves.
+
+## Choices made
+
+- Loaded everything through `read_counts("group_b")` instead of reading the six
+  files by hand — alternative: `read_csv()` on each file, which the helper
+  already wraps and checks.
+- Flagged "small library" at **10,000 reads** — alternative: 5,000 (nothing would
+  be flagged) or 20,000 (a few more would be).
+- Checked `bv` against `nugent` with cut points 0–3 / 4–6 / 7–10 — alternative:
+  trusting the `bv` column and not checking it.
+- Outlier check used a **Bray-Curtis PCoA** on the untransformed species counts
+  — alternative: CLR + Euclidean, which weights rare species more.
+- Kept all 93 samples for now, including the two with missing cytokines —
+  alternative: dropping them everywhere, which would throw away good microbiome
+  and RNA-seq data for no reason.

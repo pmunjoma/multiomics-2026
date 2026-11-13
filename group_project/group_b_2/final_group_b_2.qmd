@@ -1,0 +1,238 @@
+---
+title: "Study B — combined QC with live checks"
+subtitle: "Group B (contraception) · three reports merged, all five questions re-run on the data"
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: true        # show the code
+  warning: false
+  message: false
+---
+
+> This document merges the three QC reports (`01-qc Priv`, `01-qc Samwl`,
+> `StudyB_QC_Fathy`) and **re-runs every check on the data itself**, so every
+> number below is reproducible from the code shown next to it. The five set
+> questions are Sections 1–5; the reports' extra checks are in Section 6; the
+> choices-made and open-question comparisons close the document.
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(microViz)
+
+source(here("R/count_tables.R"))
+
+d    <- read_counts("group_b")   # the helper: errors out if IDs don't align
+meta <- d$metadata               # 93 rows, one per participant
+mic  <- d$species                # 220 species x 93 samples, raw counts
+gen  <- d$genes                  # 14,226 genes   x 93 samples, raw counts
+cyt  <- d$cytokines              # 15 cytokines, wide format
+```
+
+## 1. Do sample IDs match across all the tables?
+
+Every test lines samples up by position, so the four tables must hold the same
+IDs — in the same order, not just the same set.
+
+```{r}
+ids <- list(
+  metadata  = meta$sample_id,
+  species   = colnames(mic),
+  genes     = colnames(gen),
+  cytokines = cyt$sample_id
+)
+
+sapply(ids, \(x) setequal(x, ids$metadata))   # same IDs everywhere?
+sapply(ids[-1], \(x) identical(x, ids$metadata))  # and in the same ORDER?
+```
+
+**Verdict: pass.** Same IDs, same order, all four tables. (Priv's report
+verified the cytokine join by hand; Samwl added the order check; Fathy's report
+shows neither but inherits the helper's guarantee.)
+
+## 2. Library sizes in both count tables — and which samples have very few reads?
+
+```{r}
+libs <- colSums(mic)      # total reads per sample, species table
+summary(libs)
+names(libs)[libs < 10000]   # flag anything under 10k reads
+
+gen_libs <- colSums(gen)  # same for the gene table (libraries ~400x bigger)
+summary(gen_libs)
+names(gen_libs)[gen_libs < 1e6]   # should be empty
+```
+
+```{r}
+#| fig.width: 8
+#| fig.height: 3.2
+tibble(sample_id = colnames(mic),
+       species_reads = libs, gene_reads = gen_libs) |>
+  pivot_longer(-sample_id, names_to = "table", values_to = "reads") |>
+  ggplot(aes(x = reads, y = reorder(sample_id, reads), fill = table)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~table, scales = "free_x") +
+  labs(x = "reads per sample", y = NULL, title = "Library sizes, Study B") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+**Verdict: one flag.** `B006` (5,247 reads, ~18% of the median) is the only
+small microbiome library — Priv and Samwl flagged it, Fathy quoted the minimum
+without flagging it. The gene table is clean: its minimum (5.86M) is ~6× the
+flag threshold. Only Samwl's report checked both tables.
+
+## 3. Is any metadata missing?
+
+```{r}
+meta |> summarise(across(everything(), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing")
+
+# The reports' extra catch: the cytokine file is a fourth table — check it too
+cyt |> summarise(across(-sample_id, \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "marker", values_to = "missing") |>
+  filter(missing > 0) |>
+  arrange(marker)
+```
+
+**Verdict: metadata complete; two cytokine gaps.** All 8 metadata columns have
+0 `NA` (all three reports agree). But `B018` and `B029` are missing **all 15
+cytokines** — fine for microbiome/RNA-seq work, fatal for cytokine analyses
+(only Priv's report caught this).
+
+## 4. Is `rnaseq_batch` balanced against `arm`?
+
+```{r}
+meta |>
+  count(arm, rnaseq_batch) |>
+  pivot_wider(names_from = rnaseq_batch, values_from = n, values_fill = 0) |>
+  mutate(total = B1 + B2, pct_B1 = scales::percent(B1 / total, accuracy = 0.1))
+```
+
+**Verdict: balanced.** Every arm sits ~half B1, half B2 (51.3% / 50.0% /
+50.0%) — the one check all three reports ran and agreed on. A batch effect
+cannot easily masquerade as a method effect; Fathy's report records the
+decision *not* to batch-correct downstream.
+
+## 5. Did the arms differ at baseline?
+
+The study was **not randomised** — participants chose their method — so the
+arms may start different before any biology acts.
+
+```{r}
+meta |>
+  group_by(arm) |>
+  summarise(n = n(),
+            mean_ph = round(mean(ph), 2),
+            mean_nugent = round(mean(nugent), 1),
+            bv_pos = sum(bv == "positive"),
+            sti_pos = sum(any_sti == 1))
+```
+
+**Verdict: they did.** The injectable arm starts with more BV (19 vs 10), a
+higher pH (4.86) and Nugent score (4.6). Later models should adjust for
+`bv`/`ph` rather than trust the raw arm contrast. **Only Samwl's report ran
+this check** — the largest single coverage gap across the three.
+
+## 6. Extra checks the reports ran (re-run here)
+
+### Does the metadata contradict itself? (Priv only)
+
+```{r}
+table(bv = meta$bv,
+      nugent_band = cut(meta$nugent, c(-1, 3, 6, 10),
+                        labels = c("0-3", "4-6", "7-10")))
+```
+
+Perfect agreement: 51/51 negative, 3/3 intermediate, 39/39 positive.
+
+### How sparse are the tables, and which species could support a test?
+
+```{r}
+c(species_zeros = mean(mic == 0), gene_zeros = mean(gen == 0))
+sum(rowSums(mic) > 0)   # species detected at all
+sum(rowSums(mic > 0) >= 10)  # species in >=10 samples (Samwl's filter)
+```
+
+86 of 220 species were never detected; only 62 appear in ≥10 of 93 samples.
+
+### Do the arms differ in alpha diversity? (Samwl tested; Fathy described)
+
+```{r}
+shannon <- apply(mic, 2, \(x) {
+  p <- x / sum(x); p <- p[p > 0]
+  -sum(p * log(p))
+})
+shan <- tibble(sample_id = names(shannon), shannon = shannon) |>
+  left_join(select(meta, sample_id, arm), by = "sample_id")
+
+shan |> group_by(arm) |>
+  summarise(n = n(), median = round(median(shannon), 2))
+
+kruskal.test(shannon ~ arm, data = shan)
+```
+
+Medians 1.74 / 0.90 / 1.59, but Kruskal–Wallis **p = `r
+round(kruskal.test(shannon ~ arm, data = shan)$p.value, 2)`** — no significant
+arm difference. Fathy's report describes the same pattern as biology without a
+test; the data side with Samwl.
+
+### Do any samples look like outliers overall? (Priv only)
+
+```{r}
+#| fig.width: 8
+#| fig.height: 3.6
+ps_b <- as_counts("group_b")
+o <- ps_b |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA")
+
+ord_plot(o, colour = "arm") +
+  theme_bw(base_size = 10) +
+  ggtitle("PCoA coloured by arm")
+```
+
+No isolated sample, no batch cluster — B006 does not sit apart, which supports
+keeping it (open question 2, below).
+
+## 7. Choices made — three reports, compared
+
+| Topic | Priv | Samwl | Fathy | Can any of us say why? |
+|---|---|---|---|---|
+| Species filter | drop all-zero → 134 | ≥10 samples → 62 | taxa in >10% | **Yes, but rules differ** — Priv: keep distances cheap; Samwl: singletons can't support a 3-arm test; Fathy: strict filter. Group must pick one → OQ1 |
+| Outlier check | Bray–Curtis PCoA | none | none | **No** — the two reports that skipped it are silent → OQ4 |
+| Alpha diversity | absent | Shannon + Kruskal–Wallis | described, no test | **No** — tested-but-null vs untested-but-asserted → OQ3 |
+| Sample B006 | keep pending ordination | keep pending ordination | "sufficient", no flag | **Partly** — depth reason given, ordination test never engaged → OQ2 |
+| Batch correction | decision unstated | decision unstated | explicitly skipped | **Yes** — Fathy says why (balanced) → adopt |
+| Threshold / samples / taxa | 10k flag, all 93, all 220 | same | same | **Same** — agreed everywhere |
+
+## 8. Open questions — the group's list
+
+1. **Which species filter?** all-zero drop (134) vs prevalence ≥10 (62).
+2. **Does B006 sit at the edge of the ordination?** The PCoA above says no —
+   the rerun-without-B006 sensitivity test would close this.
+3. **Alpha diversity: signal or noise?** p = 0.47 says noise; go with Samwl's
+   framing unless the BV-adjusted analysis changes it.
+4. **Who owns the outlier check?** Priv's PCoA stands unless the group wants
+   CLR + Euclidean (Samwl's stated alternative).
+5. **Cytokines:** confirm B018/B029 are dropped from cytokine analyses only.
+
+**Verdict: the data are fit for analysis.** IDs match, metadata is complete,
+batch is balanced, and no sample must be dropped. Settle OQ1 before any
+per-species test, and adjust for `bv`/`ph` when modelling the arm contrast.
+
+## Choices made
+
+- Re-ran every check live on the data rather than quoting the reports —
+  alternative: transcribe their numbers, which could silently drift from the data.
+- Used `read_counts("group_b")` for loading — alternative: six manual
+  `read_csv()` calls without the ID checks the helper performs.
+- Flagged small libraries at 10,000 (species) / 1,000,000 (genes) reads,
+  following both Quarto reports — alternative: 5k, which flags nothing.
+- Included the PCoA outlier check despite it being Priv's alone — alternative:
+  omit it, which would leave the group without any ordination evidence.
+- Reported choice differences without adjudicating them (the group decides) —
+  alternative: pick a winner, which is not an editing decision.
+- Kept this document lean by merging the reports' overlapping prose —
+  alternative: include all three reports verbatim, which would repeat each
+  number three times.

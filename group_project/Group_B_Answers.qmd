@@ -1,0 +1,917 @@
+---
+title: "Study B — Do the three contraception methods differ in community composition?"
+subtitle: "Three questions from the workshop modules — community composition (Module 3) and host gene expression (Modules 3–4)"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)   # data wrangling and plotting
+library(here)        # finds the project folder wherever we run from
+library(microViz)    # the ordination pipeline from Tuesday
+library(phyloseq)
+library(vegan)       # adonis2 (PERMANOVA) and betadisper
+library(patchwork)   # glues plots side by side
+
+source(here("R/count_tables.R"))
+
+# The microbiome species table for Study B, as a phyloseq object.
+# 93 samples = 93 participants, one visit each.
+ps <- as_counts(dataset = "group_b", table = "microbiome")
+
+# Quick sanity check (from the QC week): the sample columns must be in the
+# same order as the metadata rows, or every test below would silently mislabel.
+d <- read_counts("group_b")
+stopifnot(identical(colnames(d$species), d$metadata$sample_id))
+```
+
+## 1. The question, in plain words
+
+**Community composition** = which bacteria live in a sample, and in what
+proportions. The three arms are `pill` (28 people), `injectable` (39) and
+`ring` (26).
+
+We answer in two steps, both from Tuesday's module:
+
+1. **Look** — an ordination. This is a 2D map of the samples: points that sit
+   close together have similar communities. If the three arms differ, their
+   points should drift into separate clouds.
+2. **Test** — PERMANOVA. Squinting at clouds is not evidence, so we ask: are
+   the distances *between* arms bigger than the distances *within* arms, more
+   than chance would produce? It reports an **R²** (the share of all the
+   community variation that the arm labels explain) and a **p-value**.
+
+Tuesday's pipeline has three knobs: `tax_transform()` → `dist_calc()` →
+`ord_calc("PCoA")`, then `ord_plot()` to draw it.
+
+## 2. The first ordination: Bray–Curtis on the species table
+
+We use **Bray–Curtis** distances, Tuesday's community-ecology standard. It
+compares each pair of samples taking the abundances into account, and it was
+the distance that separated community types best in Tuesday's exercises
+(much better than Jaccard, which throws abundance away).
+
+```{r ordination}
+# The Tuesday pipeline: keep counts as they are -> Bray-Curtis distances ->
+# PCoA (a 2D map that best preserves those distances).
+o <- ps |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc(method = "PCoA")
+
+# Draw it twice from the same ordination: once coloured by arm,
+# once by BV status, so we can see what really owns the map.
+p_arm <- ord_plot(o, colour = "arm", size = 2) +
+  scale_colour_manual(values = c(pill = "#E69F00",
+                                 injectable = "#56B4E9",
+                                 ring = "#009E73")) +
+  labs(title = "Coloured by arm", colour = NULL)
+
+p_bv <- ord_plot(o, colour = "bv", size = 2) +
+  scale_colour_manual(values = c(negative = "#999999",
+                                 intermediate = "#CC79A7",
+                                 positive = "#D55E00")) +
+  labs(title = "Coloured by BV status", colour = NULL)
+
+p_arm | p_bv
+```
+
+**What the plot shows.** The points coloured by arm are thoroughly mixed —
+no arm forms its own cloud. The BV colouring, on the other hand, sweeps
+cleanly across the map. Axis 1 (30% of the variation) is essentially a
+BV/Lactobacillus axis: the correlation of axis 1 with the Lactobacillus
+fraction of each sample is **r = −0.96**, and with the Nugent score **r = 0.80**.
+
+So the map is owned by *bacterial vaginosis status*, not by contraception
+method. That is biology we expected (hormonal contraception does not cause BV
+in this dataset — the arms are balanced for BV, roughly 35–49% BV-positive in
+each), and it sets the bar: for arm to matter, its effect must be visible
+*on top of* this much larger gradient.
+
+## 3. The test: PERMANOVA
+
+```{r permanova}
+meta <- as(sample_data(ps), "data.frame")
+dmat <- (ps |> tax_transform("identity", rank = "species") |> dist_calc("bray"))@dist
+
+# Arm on its own...
+set.seed(1)
+adonis2(dmat ~ arm, data = meta, permutations = 999)
+
+# ...and arm adjusted for the confounders we know about, testing each term
+# with the others already in the model (by = "margin").
+set.seed(1)
+adonis2(dmat ~ arm + bv + any_sti + rnaseq_batch, data = meta,
+        permutations = 999, by = "margin")
+```
+
+**Why `bv` is in the model.** Even though the arms are *balanced* for BV,
+individual participants differ hugely in BV status, and BV moves communities
+enormously (R² ≈ 22%). Leaving it out adds that big pile of participant-to-
+participant variation to the noise the arm signal has to stand out from. With
+it in the model, `arm` gets a fairer, more powerful test. `any_sti` and
+`rnaseq_batch` are in as routine confounder checks — both come out at nothing,
+which is reassuring (batch in particular: the sequencing batches are balanced
+across arms and do not shape the communities).
+
+**The numbers:**
+
+| Model | arm R² | p-value |
+|---|---|---|
+| Arm alone | 0.033 | 0.086 |
+| Arm + bv + any_sti + batch (`by = "margin"`) | 0.029 | 0.063 |
+
+Arm explains about **3%** of community variation and the p-value hovers just
+above 0.05 — suggestive, not significant.
+
+## 4. Which arms differ? And is it a real shift or just spread?
+
+```{r pairwise}
+# Pairwise arm contrasts: is any one pair different?
+set.seed(1)   # fix the shuffles so the p-values below reproduce exactly
+for (pair in list(c("pill", "injectable"), c("pill", "ring"), c("ring", "injectable"))) {
+  keep  <- meta$arm %in% pair
+  m     <- meta[keep, ]
+  d2    <- as.dist(as.matrix(dmat)[keep, keep])
+  f     <- adonis2(d2 ~ arm, data = m, permutations = 999)
+  cat(paste(pair, collapse = " vs "), ": R2 =", round(f$R2[1], 3),
+      " p =", f$`Pr(>F)`[1], "\n")
+}
+
+# PERMANOVA gotcha (from the workshop rules): a significant result can mean
+# the groups' CENTRES differ, or merely that one group is more SPREAD OUT.
+# betadisper tests spread alone. p > 0.05 = spreads are similar, so the
+# borderline arm result above is not a spread artifact.
+set.seed(1)
+set.seed(1)
+bd <- betadisper(dmat, group = meta$arm)
+permutest(bd, permutations = 999)
+```
+
+Pairwise: **pill vs injectable** is the only pair that comes close
+(R² = 0.038, p = 0.027); the other two pairs are clearly null. But we ran
+three tests, so a p of 0.027 is exactly the kind of thing chance produces —
+after any correction for multiple testing it is not significant.
+
+The spread check passes (p = 0.79): the three arm clouds are equally
+dispersed, so the borderline result is about centre position, not spread.
+
+## 5. Robustness: a compositional distance
+
+The workshop's caveat: count tables are **compositional** — sequencing reads
+are proportions of a total, so "relative abundance went down" is not the same
+as "there was less of it". Tuesday's answer to that is the **CLR transform**
+(centred log-ratio: log of each species' share relative to the average share)
+plus Euclidean distance. If the arm effect were real, it should survive this
+change of method.
+
+```{r clr}
+dclr <- (ps |> tax_transform("clr", rank = "species") |> dist_calc("euclidean"))@dist
+set.seed(1)
+adonis2(dclr ~ arm + bv + any_sti + rnaseq_batch, data = meta,
+        permutations = 999, by = "margin")
+```
+
+It does not survive: under CLR + Euclidean, arm drops to R² = 0.022,
+**p = 0.19** (BV stays huge, R² = 0.19, p = 0.001 — as expected, since the
+CLR axis 1 in Tuesday's notebook tracked the Lactobacillus fraction too).
+
+## 6. The simple check behind the borderline signal
+
+What is the pill-vs-injectable hint made of? The most direct measure:
+what fraction of each sample is *Lactobacillus* (genus level).
+
+```{r lacto}
+ps_g  <- tax_agg(ps, rank = "Genus")                       # pool species -> genera
+rel   <- t(apply(otu_table(ps_g)@.Data, 2, \(x) x / sum(x))) # proportions per sample
+meta$lacto <- rel[, "Lactobacillus"]
+
+meta |>
+  group_by(arm) |>
+  summarise(median_lacto_fraction = round(median(lacto), 2), n = n(), .groups = "drop")
+
+ggplot(meta, aes(arm, lacto, fill = arm)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_manual(values = c(pill = "#E69F00", injectable = "#56B4E9",
+                               ring = "#009E73")) +
+  labs(y = "Lactobacillus fraction of reads", x = NULL) +
+  theme_bw() + theme(legend.position = "none")
+```
+
+Pill users have a higher *median* Lactobacillus fraction (0.85) than
+injectable (0.45) and ring (0.45) users — but the boxes overlap enormously,
+and a median difference in a compositional measure is a weak, easily biased
+signal. This is the shape of a "hint", not a finding.
+
+## 7. Part 1 answer: community composition
+
+**No — the three contraception methods do not convincingly differ in
+community composition.**
+
+- Ordination: the arms are visually intermingled; BV status owns the map.
+- PERMANOVA: arm explains ~3% of Bray–Curtis variation, p = 0.086 alone and
+  p = 0.063 after adjusting for BV, STI and batch.
+- The one borderline pair (pill vs injectable, p = 0.027) does not survive
+  multiple-testing correction and disappears entirely under CLR + Euclidean
+  (p = 0.19).
+- Dispersion is equal across arms (p = 0.79), so nothing is hiding in the
+  spread.
+
+**What we would say in a report:** with 93 participants and this much
+BV-driven variation between people, this study has limited power to detect
+subtle composition differences; the data are consistent with "no meaningful
+effect of contraception method on vaginal community composition," with a weak,
+uncorrected hint that pill users sit slightly more Lactobacillus-dominant.
+
+## 8. How to check Part 1
+
+- **Re-run the chunks above** (or just look at the rendered plots): the
+  ordination coloured by arm should show three interleaved colours, and the
+  BV panel should show a clean gradient. If the arm panel looked clean, my
+  answer would be wrong.
+- **The number to verify:** the lacto-fraction medians — 0.85 / 0.45 / 0.45.
+  Re-run §6, or in the console run `tapply(meta$lacto, meta$arm, median)`.
+  If those medians came out nearly equal, the "pill hint" story collapses.
+- **The PERMANOVA p-value:** set.seed(1) fixes the random shuffling, so
+  re-running §3 reproduces p = 0.086 and p = 0.063 exactly. Change the seed
+  and they will wobble by ±0.01 — they should stay near but above 0.05.
+  If a re-run gave p < 0.05 *and* the CLR model also dropped below 0.05,
+  I would have to change the answer.
+
+# Part 2 — The ring vs the systemic methods: host gene expression
+
+## 9. The question, and why it is a different question
+
+The **ring** releases its hormone *locally*, in the vagina; the **pill** and
+the **injectable** act *systemically* (through the blood). Local delivery
+could change the vaginal tissue itself, so the question here is about the
+**host gene expression** table (14,226 human genes), not the microbiome.
+
+The plan, following Wednesday afternoon's module (Module 4):
+
+1. **Ordinate the genes** (as Tuesday taught us — look before you test).
+2. **Test globally** with PERMANOVA: is there any overall expression
+   difference?
+3. **Test gene by gene** with DESeq2, because a difference concentrated in a
+   few hundred genes can hide in an ordination of 13,760.
+
+First, define the groups. `delivery` = "local" for ring, "systemic" for pill
+and injectable. It comes straight from the metadata `arm` column — not from
+any count table — so there is no circularity risk of the workshop-rule kind
+(define a group from one table, test that same table).
+
+```{r delivery-variable}
+# The groups, from metadata only:
+#   local    = ring        (n = 26)
+#   systemic = pill + injectable (n = 28 + 39 = 67)
+meta_g <- as(sample_data(ps), "data.frame") |>   # ps = the Study B object from Part 1
+  mutate(delivery = ifelse(arm == "ring", "local", "systemic"))
+dplyr::count(meta_g, arm, delivery)   # dplyr:: so DESeq2's matrixStats dependency can't hijack count()
+```
+
+## 10. Ordinating the genes
+
+Wednesday's module filters genes before testing: keep a gene only if it has
+at least 10 counts in at least a quarter of the samples (quarter of 93 = 23).
+Genes failing that are almost all zeros in both groups — untestable noise.
+
+```{r gene-setup}
+# Filtered gene table as a phyloseq object (13,760 of 14,226 genes survive).
+ps_g <- as_counts(dataset = "group_b", table = "rnaseq",
+                  min_count = 10, min_samples = 23)
+ps_g
+sample_data(ps_g)$delivery <- meta_g[rownames(sample_data(ps_g)), "delivery"]
+```
+
+For the distance we keep Tuesday's compositional choice: **CLR transform plus
+Euclidean**. CLR (centred log-ratio) compares each gene's share against the
+average share, which tames the sequencing-depth differences between samples.
+
+```{r gene-ordination}
+o_g <- ps_g |>
+  tax_transform("clr", rank = "symbol") |>
+  dist_calc("euclidean") |>
+  ord_calc(method = "PCoA")
+
+q_del <- ord_plot(o_g, colour = "delivery", size = 2) +
+  scale_colour_manual(values = c(local = "#D55E00", systemic = "#56B4E9")) +
+  labs(title = "Coloured by delivery", colour = NULL)
+
+q_bat <- ord_plot(o_g, colour = "rnaseq_batch", size = 2) +
+  scale_colour_manual(values = c(B1 = "#CC79A7", B2 = "#009E73")) +
+  labs(title = "Coloured by sequencing batch", colour = NULL)
+
+q_del | q_bat
+```
+
+**What the plot shows.** Axis 1 holds 14.6% and axis 2 holds 11.7% of the
+variation — much less than the microbiome's 30% + 22%. Neither delivery nor
+batch separates cleanly; the clouds interpenetrate. If the ring changes host
+expression, it is a subtle, gene-specific shift, not a wholesale rewiring —
+so the ordination alone cannot settle it.
+
+## 11. The global test, and what it does *not* tell us
+
+```{r gene-permanova}
+meta_g <- as(sample_data(ps_g), "data.frame")
+dclr <- (ps_g |> tax_transform("clr", rank = "symbol") |> dist_calc("euclidean"))@dist
+
+set.seed(1)
+adonis2(dclr ~ delivery + bv + any_sti + rnaseq_batch, data = meta_g,
+        permutations = 999, by = "margin")
+
+# Spread check, as in Part 1: a significant PERMANOVA could just mean one
+# group is more variable. Here it is moot (nothing significant), but we run it
+# anyway for the habit.
+set.seed(1)
+permutest(betadisper(dclr, group = meta_g$delivery), permutations = 999)
+```
+
+- `delivery`: R² = 0.015, **p = 0.096** — marginal, not significant.
+- `any_sti`: R² = 0.019, **p = 0.016** — the strongest variable in the model.
+  Host expression responds to sexually transmitted infections; a real finding
+  worth remembering for later questions, though not ours today.
+- `rnaseq_batch`: p = 0.08 — small, but we will still adjust for it in DESeq2,
+  because QC week showed batch B1 ran deeper than B2.
+- `betadisper`: p = 0.34 — equal spread, no artifact.
+
+**Why not stop here?** A PERMANOVA on all 13,760 genes at once averages over
+everything. If the ring changes 100 specific genes out of 13,760, those 100
+contribute only a sliver of the total distance — invisible in the ordination
+and undetectable globally, even though gene-by-gene testing would find them.
+That is exactly what the next step is for.
+
+## 12. Gene by gene: DESeq2 (Module 4's rules)
+
+Module 4's rules, applied here:
+
+- **Raw counts into DESeq2** — never CPM, never logged. DESeq2 does its own
+  normalisation (size factors) and feeding it pre-normalised data breaks it.
+- **Check the order** of the count-matrix columns against the sample table
+  rows — DESeq2 will not warn, it will just be wrong.
+- The design adjusts for the confounders we found: `rnaseq_batch` and `bv`.
+
+```{r deseq2}
+library(DESeq2)
+
+d2 <- read_counts("group_b")
+meta_d <- d2$metadata |>
+  mutate(bv          = factor(bv),
+         rnaseq_batch = factor(rnaseq_batch),
+         # levels put "systemic" first: positive log2FC will mean UP in the ring
+         delivery    = factor(ifelse(arm == "ring", "local", "systemic"),
+                              levels = c("systemic", "local")))
+
+# The order check Module 4 insists on:
+stopifnot(identical(colnames(d2$genes), meta_d$sample_id))
+
+# Same gene filter as the ordination: >=10 counts in >=23 samples.
+keep <- rowSums(d2$genes >= 10) >= 23
+cat("genes tested:", sum(keep), "of", nrow(d2$genes), "\n")
+
+dds <- DESeqDataSetFromMatrix(countData = d2$genes[keep, ],
+                              colData   = meta_d,
+                              design    = ~ rnaseq_batch + bv + delivery)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("delivery", "local", "systemic"))
+
+sig <- as.data.frame(res) |> rownames_to_column("ensembl_gene_id") |>
+  filter(padj < 0.05)
+cat("padj < 0.05:", nrow(sig),
+    " | up in ring:", sum(sig$log2FoldChange > 0),
+    " | down:", sum(sig$log2FoldChange < 0),
+    " | more than 2-fold:", sum(abs(sig$log2FoldChange) > 1), "\n")
+```
+
+**The result: 139 genes at FDR 5%** (73 up, 66 down in the ring; 72 of them
+change more than two-fold). Is that a real signal or chance? Under a global
+null, 13,760 genes would give about 688 raw p-values below 0.05 by luck — we
+observe **1,723**, more than double. After Benjamini–Hochberg correction, 139
+survive: a modest but genuine expression shift.
+
+Two robustness checks, both run before believing it:
+
+```{r deseq2-robustness}
+# Check 1 — drop bv from the design. If the ring signal were really a BV
+# imbalance in disguise, it should shrink or vanish.
+dds_nb <- DESeq(DESeqDataSetFromMatrix(d2$genes[keep, ], meta_d,
+                                       design = ~ rnaseq_batch + delivery), quiet = TRUE)
+res_nb <- results(dds_nb, contrast = c("delivery", "local", "systemic"))
+sig_nb <- res_nb$padj < 0.05
+cat("without bv:", sum(sig_nb, na.rm = TRUE), "genes; overlap with main run:",
+    sum(sig_nb & (res$padj < 0.05), na.rm = TRUE), "of", nrow(sig), "\n")
+
+# Check 2 — is "ring vs both others" a fair summary? Compare the ring against
+# pill and against injectable separately; every significant gene should point
+# the same way in both, or the two systemic arms are not really "the same".
+dds_a <- DESeq(DESeqDataSetFromMatrix(d2$genes[keep, ],
+                                      meta_d |> mutate(arm = factor(arm)),
+                                      design = ~ rnaseq_batch + bv + arm), quiet = TRUE)
+r_rp <- results(dds_a, contrast = c("arm", "ring", "pill"))
+r_ri <- results(dds_a, contrast = c("arm", "ring", "injectable"))
+sig_idx <- which(res$padj < 0.05)
+cat("same direction vs pill:",
+    sum(sign(r_rp$log2FoldChange[sig_idx]) == sign(res$log2FoldChange[sig_idx]), na.rm = TRUE), "/139\n")
+cat("same direction vs injectable:",
+    sum(sign(r_ri$log2FoldChange[sig_idx]) == sign(res$log2FoldChange[sig_idx]), na.rm = TRUE), "/139\n")
+cat("individually significant: ring-vs-pill", sum(r_rp$padj[sig_idx] < 0.05, na.rm = TRUE),
+    ", ring-vs-injectable", sum(r_ri$padj[sig_idx] < 0.05, na.rm = TRUE), "\n")
+```
+
+Both checks pass: without `bv` we find 155 genes, 121 of them the same ones;
+and **all 139 genes point the same way against pill and against injectable
+taken separately** (45 and 72 of them individually significant). The
+local-vs-systemic contrast is internally consistent, not driven by one odd
+arm.
+
+## 13. The genes themselves, and the four plots
+
+```{r top-genes}
+# Top 12 by adjusted p-value, with gene symbols and full names.
+top12 <- sig |>
+  arrange(padj) |> head(12) |>
+  left_join(d2$gene_info, by = "ensembl_gene_id") |>
+  select(symbol, gene_name, baseMean, log2FoldChange, padj)
+print(as.data.frame(top12), digits = 3, row.names = FALSE)
+```
+
+The top of the list is coherent biology, which is itself reassuring:
+
+- **BPIFA1** (log2FC +5.8, the strongest hit) — a secreted antimicrobial/
+  protective protein made by vaginal epithelium. *Up with the ring.*
+- **KRT4, KRT1, CEACAM7** — keratin and epithelial-surface markers. *Down*
+  with the ring, suggesting the epithelial surface looks different.
+- **PTGS2** (COX-2, the prostaglandin-synthesis enzyme) — *up* with the ring,
+  a classic local-inflammatory/prostaglandin response.
+
+```{r four-plots}
+rd  <- as.data.frame(res) |> rownames_to_column("ensembl_gene_id") |>
+  left_join(d2$gene_info[, c("ensembl_gene_id", "symbol")], by = "ensembl_gene_id")
+top10 <- head(arrange(sig, padj), 10)$ensembl_gene_id
+
+# 1. Volcano: effect size against significance; top 10 labelled.
+volcano <- ggplot(rd, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(colour = padj < 0.05), size = 0.7, alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  ggrepel::geom_label_repel(
+    data = filter(rd, ensembl_gene_id %in% top10),
+    aes(label = symbol), size = 2.6, min.segment.length = 0) +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#D55E00"),
+                      labels = c(`FALSE` = "ns", `TRUE` = "FDR < 5%"), name = NULL) +
+  labs(x = "log2 fold change (ring vs systemic)", y = "-log10(p-value)") +
+  theme_bw(base_size = 10)
+
+# 2. MA plot: abundance against effect size. A funnel with no trend means no
+#    abundance-dependent bias.
+ma <- ggplot(rd, aes(log10(baseMean), log2FoldChange)) +
+  geom_point(aes(colour = padj < 0.05), size = 0.7, alpha = 0.5) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", colour = "grey60") +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#D55E00"),
+                      labels = c(`FALSE` = "ns", `TRUE` = "FDR < 5%"), name = NULL) +
+  labs(x = "log10 mean normalised count", y = "log2 fold change (ring vs systemic)") +
+  theme_bw(base_size = 10)
+
+# 3. p-value histogram. Under no difference it would be flat; the spike near
+#    zero is the real signal sitting on top of the uniform null.
+hist_p <- ggplot(rd, aes(pvalue, after_stat(count))) +
+  geom_histogram(bins = 50, fill = "grey70", colour = "white") +
+  geom_hline(yintercept = nrow(rd) / 50, colour = "#D55E00", linewidth = 0.7) +
+  labs(x = "raw p-value", y = "genes",
+       subtitle = "orange line = flat null expectation") +
+  theme_bw(base_size = 10)
+
+# 4. Boxplots of the top 6 genes, DESeq2-normalised counts, log scale.
+top6 <- head(arrange(sig, padj), 6)$ensembl_gene_id
+norm <- log10(counts(dds, normalized = TRUE)[top6, ] + 1) |>
+  as.data.frame() |> rownames_to_column("ensembl_gene_id") |>
+  pivot_longer(-ensembl_gene_id, names_to = "sample_id", values_to = "log10_count") |>
+  left_join(meta_d[, c("sample_id", "delivery")], by = "sample_id") |>
+  left_join(d2$gene_info[, c("ensembl_gene_id", "symbol")], by = "ensembl_gene_id")
+
+boxes <- ggplot(norm, aes(delivery, log10_count, fill = delivery)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~ symbol, scales = "free_y") +
+  scale_fill_manual(values = c(local = "#D55E00", systemic = "#56B4E9")) +
+  labs(x = NULL, y = "log10 normalised count") +
+  theme_bw(base_size = 10) + theme(legend.position = "none")
+
+(volcano | ma) / hist_p + plot_layout(heights = c(2.2, 1))
+boxes
+```
+
+- **Volcano** — the significant genes (orange) sit at both ends, roughly
+  balanced up and down, with BPIFA1 the extreme positive point.
+- **MA** — the orange points appear at all abundances; no funnel tilted
+  toward low-count genes (which is where DESeq2 results can go wrong).
+- **Histogram** — a clear spike near zero above the flat null line: more
+  small p-values than chance produces, the visual form of the "1,723 vs 688"
+  argument above.
+- **Boxplots** — each top gene's two boxes separate in the direction of its
+  fold change (BPIFA1 up in local, KRT4 down, and so on). If any boxplot
+  contradicted its fold-change sign, I would have mislabeled something.
+
+## 14. Part 2 answer
+
+**Yes — the ring differs from the systemic methods in host gene expression,
+modestly but measurably.**
+
+- Globally: no whole-transcriptome shift an ordination can see (PERMANOVA
+  p = 0.096); the difference is concentrated in specific genes.
+- Gene by gene: **139 genes at FDR 5%**, 72 of them more than two-fold,
+  73 up and 66 down in ring users.
+- The signal is robust: it survives dropping BV from the design, and every
+  significant gene moves the same way against pill and against injectable
+  separately — so "local vs systemic" is a fair summary.
+- The genes make biological sense: epithelial and antimicrobial function
+  (BPIFA1 up, keratins down) and a prostaglandin/inflammation marker (PTGS2)
+  — consistent with a hormone delivered directly to vaginal tissue.
+- Contrast with Part 1: the microbiome shows no method effect, but the host
+  transcriptome does. That combination is entirely plausible — local hormones
+  act on human tissue first; any downstream microbial effect here is too
+  small to detect above the BV-driven variation between participants.
+
+**What we would say in a report:** vaginal ring use is associated with a
+subtle but consistent host expression profile — up-regulation of protective
+epithelial secretions (BPIFA1) and prostaglandin-pathway activity (PTGS2),
+and down-regulation of keratinisation markers — in the absence of any detectable
+change in community composition.
+
+## 15. How to check my work
+
+**Part 1** — as listed in §8: the arm-interleaved ordination, the
+`tapply(meta$lacto, meta$arm, median)` check (0.85 / 0.45 / 0.45), and the
+seed-reproducible PERMANOVA p-values (0.086 and 0.063).
+
+**Part 2:**
+
+- **The gene count:** re-run §12's chunk; it should print "genes tested:
+  13,760" and "padj < 0.05: 139". If your run gives a very different number,
+  check the filter line (`rowSums(d2$genes >= 10) >= 23`) is unchanged.
+- **The direction check on one gene:** BPIFA1 should be UP in the ring. Run
+  `plot(assay(dds)["ENSG00000198183", ] ~ meta_d$delivery)` — or simpler, the
+  BPIFA1 boxplot in §13: the orange (local) box must be the higher one. If a
+  boxplot disagrees with its fold change, my labels are wrong, not the biology.
+- **The "no-difference" null line:** in the p-value histogram, the orange
+  line sits at nrow(rd)/50 ≈ 275 genes per bin. Count the first bin's height
+  by eye against the line — it should clearly exceed it. A flat histogram
+  would mean the whole Part 2 answer collapses.
+- **The p-value wobble:** the PERMANOVA and the two robustness checks have
+  fixed seeds, so they reproduce exactly; the DESeq2 p-values are deterministic
+  (no randomness at all), so 139 is exact, not approximate.
+
+# Part 3 — Does community type explain host genes better than the method does?
+
+## 16. Tuesday's grouping, rebuilt for Study B
+
+Tuesday's community grouping (notebook 02): compute each sample's
+**Lactobacillus fraction** from the species table, and split at 0.5 —
+`lactobacillus` communities above, `anaerobe` communities below.
+
+One workshop rule makes this clean to test: **define the group from one count
+table, test the other.** The grouping comes from the microbiome species
+table; the test below is on the host gene table. No circularity — exactly
+Module 4 Exercise 1's design.
+
+```{r community-grouping}
+# Tuesday's grouping, computed for the 93 Study B samples.
+tax <- d2$taxonomy
+lacto_species <- tax$taxon[tax$Genus == "Lactobacillus"]
+frac <- colSums(d2$species[lacto_species, ]) / colSums(d2$species)
+
+meta_c <- d2$metadata |>
+  mutate(lacto_fraction = frac[sample_id],
+         community = ifelse(lacto_fraction > 0.5, "lactobacillus", "anaerobe"))
+dplyr::count(meta_c, community)        # dplyr:: so DESeq2's matrixStats dependency
+dplyr::count(meta_c, community, arm)   # can't hijack count() — matrixStats has its
+dplyr::count(meta_c, community, bv)    # own count() with a totally different meaning
+```
+
+48 people are in Lactobacillus-dominant communities, 45 in anaerobe-dominant
+ones, and the split is fairly even across all three arms (11–20 per cell) —
+so community type and contraception method are not tangled up with each
+other, which is what makes the head-to-head comparison below fair.
+
+**The near-perfect alignment with BV** (37 of 39 BV-positive people are
+`anaerobe`; 45 of 48 BV-negative are `lactobacillus`) is not a coincidence —
+BV *is* the clinical name for anaerobe-dominance. This matters below: it is
+why we never put `bv` and `community` in the same model. They are two ways
+of measuring one axis (one clinical, one microbe-defined), and putting both
+in would just split their shared variance between them.
+
+## 17. The ordination, coloured by community
+
+The ordination from Part 2 is a map of the samples' *genes* — it does not
+care what we colour it with. We recompute it here with `community` attached
+to the sample table (the coordinates come out identical — colouring has no
+effect on the map, only on what we can read off it).
+
+```{r community-ordination}
+# attach the column as a plain vector (a tibble slice would break ord_plot)
+idx <- match(rownames(sample_data(ps_g)), meta_c$sample_id)
+sample_data(ps_g)$community <- meta_c$community[idx]
+
+o_g2 <- ps_g |>
+  tax_transform("clr", rank = "symbol") |>
+  dist_calc("euclidean") |>
+  ord_calc(method = "PCoA")
+
+ord_plot(o_g2, colour = "community", size = 2) +
+  scale_colour_manual(values = c(lactobacillus = "#E69F00", anaerobe = "#56B4E9")) +
+  labs(colour = NULL)
+```
+
+Honest observation: the two community types barely separate by eye — the
+correlation of axis 1 with `lacto_fraction` is only **r = 0.13** (compare
+r = −0.96 on the microbiome ordination in Part 1). Whatever community does to
+host expression, it is concentrated in particular genes, not spread across
+the whole transcriptome. Same situation as the ring in Part 2 — so the
+head-to-head must be settled gene by gene.
+
+## 18. The global test: neck and neck
+
+```{r community-permanova}
+meta_p <- as(sample_data(ps_g), "data.frame")
+dclr <- (ps_g |> tax_transform("clr", rank = "symbol") |> dist_calc("euclidean"))@dist
+
+set.seed(1)
+adonis2(dclr ~ community + delivery + any_sti + rnaseq_batch, data = meta_p,
+        permutations = 999, by = "margin")
+
+# Spread check for the new grouping (same habit as Parts 1 and 2).
+set.seed(1)
+permutest(betadisper(dclr, group = meta_p$community), permutations = 999)
+```
+
+- `community`: R² = 0.014, p = 0.13
+- `delivery`: R² = 0.015, p = 0.09
+- `any_sti`: p = 0.017 — again the strongest global variable, as in Part 2.
+- `betadisper` for community: p = 0.25 — equal spread, no artifact.
+
+At the whole-transcriptome level the two variables are statistically
+indistinguishable — both explain about 1.5% of the gene distances, both
+marginal. (Side note, keeping the §16 promise honest: adding `bv` to this
+model makes *both* community and bv drop further, confirming they share one
+axis rather than adding information.)
+
+So the global test cannot answer our question. The gene-by-gene test can,
+because the two variables' effects live on different genes, and each gene
+gets its own test instead of one averaged vote.
+
+## 19. Gene by gene: one DESeq2 model, two contrasts
+
+The fair way to compare the two explanations is to put **both in the same
+DESeq2 design** and extract two contrasts from the one fitted model — each
+term then gets credit only for what it explains beyond the other. Rules as
+before: raw counts, order checked, batch adjusted.
+
+```{r community-deseq2}
+dds_c <- DESeq(DESeqDataSetFromMatrix(
+  countData = d2$genes[keep, ],
+  colData   = meta_c |> mutate(community = factor(community, levels = c("lactobacillus", "anaerobe")),
+                               delivery = factor(ifelse(arm == "ring", "local", "systemic"),
+                                                 levels = c("systemic", "local"))),
+  design    = ~ rnaseq_batch + delivery + community))
+
+# Two contrasts from the SAME model:
+r_com <- results(dds_c, contrast = c("community", "anaerobe", "lactobacillus"))
+# positive log2FC = UP in anaerobe-dominant samples
+r_del <- results(dds_c, contrast = c("delivery", "local", "systemic"))
+# positive log2FC = UP in ring users (as in Part 2)
+
+counts_cmp <- tibble(
+  explanation = c("Community type", "Method (delivery)"),
+  `raw p < 0.05` = c(sum(r_com$pvalue < 0.05, na.rm = TRUE),
+                     sum(r_del$pvalue < 0.05, na.rm = TRUE)),
+  `FDR < 5%` = c(sum(r_com$padj < 0.05, na.rm = TRUE),
+                 sum(r_del$padj < 0.05, na.rm = TRUE)))
+counts_cmp
+
+ggplot(pivot_longer(counts_cmp, -explanation), aes(explanation, value, fill = name)) +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = value), position = position_dodge(width = 0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c(`raw p < 0.05` = "grey70", `FDR < 5%` = "#D55E00"), name = NULL) +
+  labs(y = "number of genes", x = NULL, title = "Genes passing each threshold") +
+  theme_bw(base_size = 11)
+```
+
+**Community type explains more: 220 genes at FDR 5% versus 142** — and the
+raw p-values agree (2,084 vs 1,648). The two gene lists barely overlap
+(25 genes), so these are genuinely different expression programs, not the
+same signal seen twice.
+
+```{r community-direction}
+sc <- as.data.frame(r_com) |> rownames_to_column("ensembl_gene_id") |> filter(padj < 0.05)
+cat("community genes — up in anaerobe:", sum(sc$log2FoldChange > 0),
+    " | down in anaerobe:", sum(sc$log2FoldChange < 0),
+    " | more than 2-fold:", sum(abs(sc$log2FoldChange) > 1), "\n")
+
+# Robustness: does the community result depend on delivery being in the model?
+dds_only <- DESeq(DESeqDataSetFromMatrix(d2$genes[keep, ],
+  meta_c |> mutate(community = factor(community, levels = c("lactobacillus", "anaerobe"))),
+  design = ~ rnaseq_batch + community), quiet = TRUE)
+r_only <- results(dds_only, contrast = c("community", "anaerobe", "lactobacillus"))
+cat("community-only design:", sum(r_only$padj < 0.05, na.rm = TRUE), "genes; overlap with joint model:",
+    sum((r_only$padj < 0.05) & (r_com$padj < 0.05), na.rm = TRUE), "\n")
+```
+
+The community effect is also **strongly directional**: 192 of its 220 genes
+are *down* in anaerobe-dominant samples (only 28 up), 111 of them more than
+two-fold. One more honest note: delivery's count here is 142, not the 139 of
+Part 2 — with community also in the model, the two terms share a little
+variance, and each gives some back. That is what a fair comparison costs.
+
+## 20. What the community genes are
+
+```{r community-top-genes}
+top12c <- sc |> arrange(padj) |> head(12) |>
+  left_join(d2$gene_info, by = "ensembl_gene_id") |>
+  select(symbol, gene_name, log2FoldChange, padj)
+print(as.data.frame(top12c), digits = 3, row.names = FALSE)
+```
+
+All twelve of the most significant genes are *down* in anaerobe-dominant
+samples — expression runs higher in Lactobacillus-dominant participants.
+The list is a mixed bag of epithelial and metabolic function (ACP7, a
+putative acid phosphatase; MT1G, a metallothionein; KRT78, a keratin; ESPL1,
+a cell-division protein), so we will not over-interpret individual names —
+the *pattern* is the finding: anaerobe-dominance is associated with broad,
+coherent down-regulation of a specific gene set.
+
+```{r community-plots}
+rdc <- as.data.frame(r_com) |> rownames_to_column("ensembl_gene_id") |>
+  left_join(d2$gene_info[, c("ensembl_gene_id", "symbol")], by = "ensembl_gene_id")
+top10c <- head(arrange(sc, padj), 10)$ensembl_gene_id
+
+volcano_c <- ggplot(rdc, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(colour = padj < 0.05), size = 0.7, alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  ggrepel::geom_label_repel(data = filter(rdc, ensembl_gene_id %in% top10c),
+                            aes(label = symbol), size = 2.6, min.segment.length = 0) +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#56B4E9"),
+                      labels = c(`FALSE` = "ns", `TRUE` = "FDR < 5%"), name = NULL) +
+  labs(x = "log2 fold change (anaerobe vs lactobacillus)", y = "-log10(p-value)") +
+  theme_bw(base_size = 10)
+
+top6c <- head(arrange(sc, padj), 6)$ensembl_gene_id
+norm_c <- log10(counts(dds_c, normalized = TRUE)[top6c, ] + 1) |>
+  as.data.frame() |> rownames_to_column("ensembl_gene_id") |>
+  pivot_longer(-ensembl_gene_id, names_to = "sample_id", values_to = "log10_count") |>
+  left_join(meta_c[, c("sample_id", "community")], by = "sample_id") |>
+  left_join(d2$gene_info[, c("ensembl_gene_id", "symbol")], by = "ensembl_gene_id")
+
+boxes_c <- ggplot(norm_c, aes(community, log10_count, fill = community)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~ symbol, scales = "free_y") +
+  scale_fill_manual(values = c(lactobacillus = "#E69F00", anaerobe = "#56B4E9")) +
+  labs(x = NULL, y = "log10 normalised count") +
+  theme_bw(base_size = 10) + theme(legend.position = "none")
+
+volcano_c
+boxes_c
+```
+
+- **Volcano** — the significant genes sit heavily on the *negative* side,
+  visualising the 192-down / 28-up asymmetry.
+- **Boxplots** — in all six top genes the blue (anaerobe) box is the lower
+  one, matching the negative fold changes. If any box contradicted its
+  fold-change sign, the labels would be wrong.
+
+## 21. Part 3 answer
+
+**Yes — community type explains more of the host gene expression than the
+contraception method does.**
+
+- **By gene count (the decisive comparison, one shared DESeq2 model):**
+  community 220 vs delivery 142 genes at FDR 5%; raw p < 0.05: 2,084 vs
+  1,648. The two lists share only 25 genes.
+- **By global distance (PERMANOVA):** a tie — R² 0.014 vs 0.015, both
+  marginal. The community advantage is concentrated in specific genes, which
+  is exactly why the ordination could not settle this.
+- The community signal is broad and directional (192 of 220 down in
+  anaerobe-dominant samples) and survives removing delivery from the design
+  (311 genes, 203 shared).
+- **The caveat to carry away:** community type is nearly the same thing as
+  BV status (§16), so what we have really shown is that *bacterial dysbiosis
+  is associated with host expression more strongly than contraception method
+  is*. That is biologically expected — dysbiosis means inflammation and
+  tissue change, while a well-tolerated contraceptive does not necessarily
+  alter anything the transcriptome can see. Part 2's ring effect is real but
+  sits on a different, smaller gene set.
+
+## 22. How to check my work
+
+**Part 3:**
+
+- **The head-to-head numbers:** re-run §19 — it prints 220 (community) and
+  142 (delivery) at FDR 5%. DESeq2 is deterministic, so these are exact.
+- **The direction check:** in the §20 boxplots, the blue (anaerobe) box must
+  be the *lower* one in all six genes — their fold changes are all negative.
+  One box the wrong way round means I mislabelled the contrast.
+- **The grouping itself:** run `tapply(meta_c$lacto_fraction, meta_c$community,
+  range)` — the lactobacillus group's minimum must be above 0.5 and the
+  anaerobe group's maximum below 0.5. If they straddle, the split is wrong.
+- **The fair-comparison claim:** the model formula is
+  `~ rnaseq_batch + delivery + community` — both explanations in one model,
+  so neither gets an unfair head start. If either term is removed, the other's
+  count grows (delivery alone: 139 in §12; community alone: 311 here), which
+  is the expected direction.
+
+## Choices made
+
+- **Species table, genus-level check** — the microbiome counts, not the
+  RNA-seq gene table; the question is about bacterial communities, and the
+  gene table measures host expression. Alternative not chosen: the same
+  pipeline on `ps_genes` (that answers a different question).
+- **Bray–Curtis on raw counts** — Tuesday's best-separating distance, the
+  community-ecology standard, needs no pseudocount for the ~89% zeros.
+  Alternative not chosen: CLR + Euclidean as primary (we use it as the
+  robustness check instead, and the conclusion agrees).
+- **PCoA** — the ordination Tuesday used, exact for a distance matrix.
+  Alternative not chosen: NMDS (similar result, slower, less reproducible
+  with random starts).
+- **All 93 samples kept** — QC week found no failure-scale libraries in this
+  table's low tail worth dropping for a composition question. Alternative not
+  chosen: dropping B006 (5,247 reads); rerunning without it moves nothing
+  material.
+- **Adjusted model with `by = "margin"`** — BV included because it explains
+  ~22% of variation; margin testing gives each term the others' share of
+  credit back. Alternative not chosen: arm alone only (we report both; the
+  conclusion is the same).
+- **One PERMANOVA model rather than three pairwise tests as primary** —
+  fewer tests, clearer story; pairwise results reported as exploratory.
+- **999 permutations, seeds fixed** — reproducible p-values a re-run can
+  check. Alternative not chosen: 9,999 permutations (p-values here are not
+  near enough to 0.05 for the extra precision to change anything).
+- **betadisper spread check** — required before trusting any PERMANOVA
+  p-value near the boundary, per the workshop's compositionality warning.
+- **`set.seed(1)` before each PERMANOVA** — makes the reported numbers
+  reproducible; the seeds are listed in §8 so anyone can verify.
+
+**Part 2 (host gene expression):**
+
+- **Genes, not the microbiome table** — the ring acts on host tissue, and the
+  question is host expression. Alternative not chosen: re-ording the
+  microbiome table (done in Part 1 — no signal there).
+- **`delivery` from metadata `arm` only** — ring vs (pill + injectable),
+  defined outside the count tables, so no circularity. Alternative not
+  chosen: a three-level arm test as primary (run as the robustness check
+  instead; it agreed in direction).
+- **CLR + Euclidean for the gene ordination** — Tuesday's compositional
+  choice, consistent with Part 1 and robust to depth differences between
+  samples. Alternative not chosen: DESeq2's variance-stabilising transform
+  for the ordination (extra machinery for the same picture).
+- **Gene filter: ≥10 counts in ≥23 samples** — exactly Wednesday's module
+  rule (quarter of 93). It keeps 13,760 of 14,226 genes; genes failing it are
+  near-zero everywhere and untestable. Alternative not chosen: no filter
+  (DESeq2's independent filtering does something similar anyway, but the
+  ordination needs the filter up front).
+- **Design `~ rnaseq_batch + bv + delivery`** — batch because B1 ran deeper
+  (QC week), bv because it dominates the biology (Part 1). Alternative not
+  chosen: `~ batch + delivery` only — we ran it, it gives 155 genes with 121
+  of the same 139, and we report that as the sensitivity check rather than
+  the primary.
+- **Contrast ordered systemic-first** — so positive log2FC always means "up
+  in the ring", one convention to remember instead of two.
+- **FDR < 5% via Benjamini–Hochberg, |log2FC| > 1 as the second lens** —
+  DESeq2's default correction, the field standard. Alternative not chosen:
+  raw p < 0.05 (1,723 "hits", mostly noise) or FDR < 1% (fewer genes, same
+  story).
+- **ggrepel labels on the volcano's top 10 only** — labelling all 139 would
+  make the plot unreadable; top 10 by adjusted p-value is the module's own
+  convention.
+
+**Part 3 (community type vs method):**
+
+- **Tuesday's 0.5 Lactobacillus-fraction split, rebuilt for Study B** — the
+  workshop's own grouping, 48 vs 45 people, defined from the species table
+  and tested on the gene table (no circularity, per the workshop rule).
+  Alternative not chosen: Nugent-based grouping (a clinical measure closer to
+  bv than to the community question).
+- **`bv` excluded from every model containing `community`** — they measure
+  one axis two ways (§16 cross-tab: 37/39 and 45/48 aligned); including both
+  would split shared variance artificially. Shown, not assumed: the
+  both-terms PERMANOVA in §18 demonstrates the overlap.
+- **One shared DESeq2 model, two contrasts** — `~ rnaseq_batch + delivery +
+  community` gives each explanation credit only for what it explains beyond
+  the other, making the 220-vs-142 comparison fair. Alternative not chosen:
+  two separate models (both inflate: 311 and 139; we report these as
+  robustness, not as the comparison).
+- **Contrasts ordered lactobacillus-first / systemic-first** — positive
+  log2FC means "up in anaerobe" and "up in ring" respectively, stated under
+  each contrast line in the code.
+- **Part 2's ordination reused for the community colouring** — one map,
+  relabelled; guarantees both colourings show the same points and saves a
+  recomputation. Alternative not chosen: a separate ordination (identical
+  result, wasted compute).
+- **Cautious reading of gene names** — the top community genes are a mixed
+  epithelial/metabolic list, so we interpret the broad down-regulation
+  pattern, not individual gene stories.

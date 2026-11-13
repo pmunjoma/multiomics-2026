@@ -47,11 +47,56 @@ count(metadata, time_point, community)
 
 **1. Testing 13,738 genes, how many get a raw p-value below 0.05 if nothing is truly different?**
 
-- *Your answer:*
+- *Your answer:* about 687 of them (5% of 13,738)
+A p-value is the probability of seeing a result at least this extreme if nothing is truly different
+(that's the "null hypothesis"). By design, when nothing is truly different, a p-value lands below 0.05 five percent of the time — that's what the 0.05 cutoff means.
+
+So even in a dataset where every single gene is unaffected:
+
+- 13,738 × 0.05 ≈ 687 genes will "win" by pure luck.
+
+These are called false positives. Each individual test has only a 5% chance of a false positive, but run thousands of tests and some are guaranteed to sneak through. This is why we correct for multiple testing (e.g. with FDR — "false discovery rate", which adjusts p-values so that among the genes you call significant, only ~5% are expected to be flukes).
+
+```{r} 
+
+   # simulate 13,738 comparisons between two fake groups of 20
+   # (t-test p-values, nothing truly different anywhere)
+   set.seed(1)
+   pvals <- replicate(13738, t.test(rnorm(20), rnorm(20))$p.value)
+
+   sum(pvals < 0.05)   # how many "significant" genes?
+   sum(pvals < 0.05) / 13738   # should be close to 0.05
+```
 
 **2. Would you rather have 157 samples at one visit, or 471 across three visits? Why?**
 
-- *Your answer:*
+- *Your answer:* it depends on whether the 471 are the same people measured
+ three times, or 471 different people.
+
+ Case 1: 471 samples from the same 157 people (your pregnancy cohort)
+
+ This is what your instructional dataset actually is. Here the 471 samples are not independent — visit 2 of a participant looks a lot like her visit 1. So you don't really have 471 independent observations;nyou have 157 people, each seen three times.
+
+ Case 2: 471 samples from 471 different people, one visit each
+
+ More independent information — more power for comparing groups (e.g. preterm vs term), more diversity in who's included, simpler statistics. But you can only describe cross-sectional differences ("group A differs from group B right now"), never within-person trajectories.
+
+ My answer for your data
+
+ For the questions this week — does the vaginal microbiome change over pregnancy, and does it differ in preterm birth — I'd take the 471 across three visits. Longitudinal change is exactly what a single snapshot can't give you, and 157 people × 3 is plenty for a workshop. But I'd never forget they're 157 people, not 471.
+
+ ```{r}
+   source(here::here("R/count_tables.R"))
+   d <- read_counts("instructional")
+
+   # Shannon diversity per sample, then look at the same person across visits
+   library(phyloseq); library(microViz)
+   ps <- as_counts(table = "microbiome", data = d)  # if this differs, check ?as_counts
+   div <- microbiome::alpha(ps, index = "shannon")
+   # merge with metadata, spread by visit, then:
+   # cor(div_wide$visit1, div_wide$visit2)
+ ```
+
 
 **3. Will more significant genes be higher in anaerobe-dominant or Lactobacillus-dominant samples?**
 
